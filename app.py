@@ -1,74 +1,38 @@
-import os
-import logging
 from flask import Flask, render_template, request, jsonify
 import pandas as pd
 import joblib
 import json
 import numpy as np
 
-# Configure basic logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-app = Flask(__name__, static_folder="static", template_folder="templates")
-
-# ---------- Helper: safe path resolver ----------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-def path_in_base(filename):
-    return os.path.join(BASE_DIR, filename)
+app = Flask(__name__)
 
 # ---------- Load Data and Models ----------
-pcos_data = None
-pcos_vectorizer = None
-pcos_model = None
-bc_model = None
-bc_scaler = None
-bc_columns = None
-followup_data = {}
+# PCOS
+pcos_data = pd.read_csv("symptom_disease.csv")
+pcos_vectorizer = joblib.load("vectorizer.pkl")
+pcos_model = joblib.load("pcos_model.pkl")
 
-try:
-    pcos_data = pd.read_csv(path_in_base("symptom_disease.csv"))
-    logger.info("Loaded symptom_disease.csv")
-except Exception as e:
-    logger.warning(f"Could not load symptom_disease.csv: {e}")
+# Breast Cancer
+bc_model = joblib.load("breast_cancer_rf_model.pkl")
+bc_scaler = joblib.load("scaler.pkl")
+bc_columns = joblib.load("training_columns.pkl")
 
-try:
-    pcos_vectorizer = joblib.load(path_in_base("vectorizer.pkl"))
-    pcos_model = joblib.load(path_in_base("pcos_model.pkl"))
-    logger.info("Loaded PCOS vectorizer and model")
-except Exception as e:
-    logger.warning(f"Could not load PCOS model/vectorizer: {e}")
+# Multilingual follow-up questions
+with open("followup_questions.json", "r", encoding="utf-8") as f:
+    followup_data = json.load(f)
 
-try:
-    bc_model = joblib.load(path_in_base("breast_cancer_rf_model.pkl"))
-    bc_scaler = joblib.load(path_in_base("scaler.pkl"))
-    bc_columns = joblib.load(path_in_base("training_columns.pkl"))
-    logger.info("Loaded Breast Cancer model, scaler and columns")
-except Exception as e:
-    logger.warning(f"Could not load Breast Cancer model/scaler/columns: {e}")
-
-try:
-    with open(path_in_base("followup_questions.json"), "r", encoding="utf-8") as f:
-        followup_data = json.load(f)
-    logger.info("Loaded followup_questions.json")
-except Exception as e:
-    logger.warning(f"Could not load followup_questions.json: {e}")
-
-# Store user sessions
+# User session storage
 user_sessions = {}
 
-# ---------- Symptom → Disease Predictor ----------
-def predict_disease(user_input: str):
-    if not user_input:
-        return None
+# ---------- Predict Disease from symptom ----------
+def predict_disease(user_input):
+    user_input = user_input.lower()  # lowercase for uniformity
 
-    user_input = user_input.lower()
-
+    # Keyword mapping for common symptoms (all lowercase!)
     keyword_map = {
         "acne": "PCOS",
-        "muttu": "PCOS",
-        "ಮುಟ್ಟು": "PCOS",
+        "muttu": "PCOS",        # English transliteration
+        "ಮುಟ್ಟು": "PCOS",        # Kannada script
         "lump": "Breast Cancer",
         "breast": "Breast Cancer",
         "swelling": "Breast Cancer",
@@ -82,94 +46,46 @@ def predict_disease(user_input: str):
         "urinate": "Diabetes"
     }
 
+    # Check keyword map
     for word, disease in keyword_map.items():
-        if word in user_input:
+        if word in user_input:   # partial match works now
             return disease
 
-    if pcos_data is not None and "Symptoms" in pcos_data.columns:
-        for idx, row in pcos_data.iterrows():
-            try:
-                symptoms = [s.strip().lower() for s in str(row.get("Symptoms", "")).split(",")]
-                if any(w in user_input for w in symptoms if w):
-                    return row.get("Disease")
-            except Exception:
-                continue
+    # Check PCOS CSV as fallback
+    for idx, row in pcos_data.iterrows():
+        symptoms = [s.strip().lower() for s in row["Symptoms"].split(",")]
+        if any(word in user_input for word in symptoms):
+            return row["Disease"]
 
     return None
 
-# ---------- HOME ----------
+# ---------- Flask Routes ----------
 @app.route("/")
 def home():
-    if os.path.exists(path_in_base(os.path.join("templates", "index.html"))):
-        return render_template("index.html")
-    return "PCOS Chatbot API is running. Use POST /predict or POST /get."
+    return render_template("index.html")
 
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok"})
-
-# ---------- BASE44 AI DIAGNOSIS ENDPOINT ----------
-@app.post("/predict")
-def base44_predict():
-    """
-    Required by Base44 AI Diagnosis Mode.
-    Input: {"symptoms": "acne"}
-    Output: {"diagnosis": "PCOS", "confidence": 0.85}
-    """
-    try:
-        data = request.get_json(force=True)
-        symptoms_text = data.get("symptoms", "").strip()
-
-        if not symptoms_text:
-            return jsonify({"error": "No symptoms provided"}), 400
-
-        disease = predict_disease(symptoms_text)
-
-        if disease:
-            return jsonify({
-                "diagnosis": disease,
-                "confidence": 0.85
-            })
-
-        return jsonify({
-            "diagnosis": "Unknown",
-            "confidence": 0.0
-        })
-
-    except Exception as e:
-        logger.exception(f"/predict error: {e}")
-        return jsonify({"error": "Internal Server Error"}), 500
-
-# ---------- ORIGINAL CHATBOT ENDPOINT ----------
 @app.route("/get", methods=["POST"])
 def chatbot_response():
-    try:
-        data_json = request.get_json(force=True)
-    except Exception:
-        return jsonify({"response": "Invalid JSON"}), 400
-
+    data_json = request.get_json()
     user_id = data_json.get("user_id", "default")
     user_input = data_json.get("msg", "").strip()
     lang = data_json.get("lang", "en")
 
+    # ---------- Start new session ----------
     if user_id not in user_sessions:
         disease = predict_disease(user_input)
         if disease:
-            questions_for_lang = followup_data.get(disease, {}).get(lang, []) if followup_data else []
             user_sessions[user_id] = {
                 "disease": disease,
-                "questions": questions_for_lang.copy(),
+                "questions": followup_data.get(disease, {}).get(lang, []).copy(),
                 "answers": [],
-                "total_questions": len(questions_for_lang)
+                "total_questions": len(followup_data.get(disease, {}).get(lang, []))
             }
             if user_sessions[user_id]["questions"]:
                 first_q = user_sessions[user_id]["questions"].pop(0)
                 return jsonify({"response": first_q, "progress": 0})
             else:
-                return jsonify({
-                    "response": f"✅ Symptoms indicate **{disease}**, but no follow-up questions configured.",
-                    "progress": 0
-                })
+                return jsonify({"response": f"✅ Symptoms indicate **{disease}**, but no follow-up questions are configured.", "progress": 0})
         else:
             unknown_text = {
                 "en": "🤔 I'm not sure. Please describe your symptoms more clearly.",
@@ -178,62 +94,47 @@ def chatbot_response():
             }
             return jsonify({"response": unknown_text.get(lang, unknown_text["en"]), "progress": 0})
 
+    # ---------- Existing session ----------
     session = user_sessions[user_id]
+    session["answers"].append(user_input)
 
-    if len(user_input) > 0:
-        session["answers"].append(user_input[:1000])
+    total = session["total_questions"]
+    answered = len(session["answers"])
+    progress = int((answered / total) * 100) if total > 0 else 100
 
-    total = session.get("total_questions", 0)
-    answered = len(session.get("answers", []))
-    progress = int((answered / total) * 100) if total else 100
-
-    if session.get("questions"):
+    if session["questions"]:
         next_q = session["questions"].pop(0)
         return jsonify({"response": next_q, "progress": progress})
+    else:
+        disease = session["disease"]
+        del user_sessions[user_id]
 
-    disease = session.get("disease")
-    del user_sessions[user_id]
-    probability = 0.0
-
-    if disease == "PCOS" and pcos_model and pcos_vectorizer:
-        try:
-            text_input = " ".join(session.get("answers", []))
+        # ---------- Predict probability ----------
+        probability = 0
+        if disease == "PCOS":
+            text_input = " ".join(session["answers"])
             X_input = pcos_vectorizer.transform([text_input])
-            if hasattr(pcos_model, "predict_proba"):
-                probability = float(pcos_model.predict_proba(X_input)[0][1]) * 100
-            else:
-                pred = pcos_model.predict(X_input)[0]
-                probability = 100.0 if pred == 1 else 0.0
-        except Exception as e:
-            logger.exception(f"PCOS model error: {e}")
+            probability = pcos_model.predict_proba(X_input)[0][1] * 100
 
-    elif disease == "Breast Cancer" and bc_model and bc_scaler and bc_columns:
-        try:
+        elif disease == "Breast Cancer":
             input_dict = {col: 0 for col in bc_columns}
-            answers = session.get("answers", [])
             for i, col in enumerate(bc_columns):
-                if i < len(answers):
-                    ans = answers[i].strip().lower()
-                    input_dict[col] = 1 if ans in ("yes", "y", "true", "1") else 0
+                if i < len(session["answers"]):
+                    answer = session["answers"][i]
+                    input_dict[col] = 1 if answer.lower() == "yes" else 0
             df_input = pd.DataFrame([input_dict])
             df_scaled = bc_scaler.transform(df_input)
-            if hasattr(bc_model, "predict_proba"):
-                probability = float(bc_model.predict_proba(df_scaled)[0][1]) * 100
-            else:
-                pred = bc_model.predict(df_scaled)[0]
-                probability = 100.0 if pred == 1 else 0.0
-        except Exception as e:
-            logger.exception(f"Breast cancer model error: {e}")
+            probability = bc_model.predict_proba(df_scaled)[0][1] * 100
 
-    final_texts = {
-        "en": f"✅ Based on your responses, your likelihood of **{disease}** is **{probability:.1f}%**.\nPlease consult a doctor.",
-        "hi": f"✅ आपके उत्तरों के आधार पर **{disease}** होने की संभावना **{probability:.1f}%** है।\nकृपया डॉक्टर से संपर्क करें।",
-        "kn": f"✅ ನಿಮ್ಮ ಪ್ರತಿಕ್ರಿಯೆಗಳ ಆಧಾರದ ಮೇಲೆ **{disease}** ಸಂಭವನೀಯತೆ **{probability:.1f}%**.\nದಯವಿಟ್ಟು ವೈದ್ಯರನ್ನು ಸಂಪರ್ಕಿಸಿ."
-    }
+        final_texts = {
+            "en": f"✅ Based on your responses, your likelihood of **{disease}** is approximately **{probability:.1f}%**.\nPlease consult a healthcare professional for proper evaluation.",
+            "hi": f"✅ आपके उत्तरों के आधार पर, आपके **{disease}** होने की संभावना लगभग **{probability:.1f}%** है।\nकृपया उचित मूल्यांकन के लिए स्वास्थ्य विशेषज्ञ से परामर्श लें।",
+            "kn": f"✅ ನಿಮ್ಮ ಪ್ರತಿಕ್ರಿಯೆಗಳ ಆಧಾರದ ಮೇಲೆ, ನಿಮ್ಮ **{disease}** ಹೊಂದುವ ಸಾಧ್ಯತೆ ಸುಮಾರು **{probability:.1f}%**.\nದಯವಿಟ್ಟು ಸರಿಯಾದ ಮೌಲ್ಯಮಾಪನಕ್ಕಾಗಿ ಆರೋಗ್ಯ ತಜ್ಞರನ್ನು ಸಂಪರ್ಕಿಸಿ."
+        }
 
-    return jsonify({"response": final_texts.get(lang, final_texts["en"]), "progress": 100})
+        return jsonify({"response": final_texts.get(lang, final_texts["en"]), "progress": 100})
 
-# Run locally only — Railway uses Gunicorn
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(debug=True)
+
 
