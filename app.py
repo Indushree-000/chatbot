@@ -227,7 +227,6 @@ def chatbot_response():
 
     return jsonify({"response": final_texts.get(lang, final_texts["en"]), "progress": 100})
 
-
 # ---------- RUN ----------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
