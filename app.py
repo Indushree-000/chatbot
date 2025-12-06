@@ -1,3 +1,4 @@
+from flask_cors import CORS
 import os
 import logging
 from flask import Flask, render_template, request, jsonify
@@ -11,6 +12,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
+CORS(app)
 
 # ---------- Helper: safe path resolver ----------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
